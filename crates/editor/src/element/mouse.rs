@@ -623,6 +623,22 @@ impl EditorElement {
             return;
         }
 
+        if click_count == 2
+            && !modifiers.modified()
+            && point_for_position.column_overshoot_after_line_end == 0
+            && let Some((hint, _)) = position_map
+                .snapshot
+                .inlay_hint_at(point_for_position.exact_unclipped)
+            && let Some(buffer_id) = hint
+                .position
+                .raw_text_anchor()
+                .map(|anchor| anchor.buffer_id)
+            && editor.apply_inlay_hint_text_edits([(buffer_id, hint.id)], window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+
         if EditorSettings::get_global(cx)
             .drag_and_drop_selection
             .enabled
