@@ -4837,16 +4837,18 @@ impl EditorElement {
         display_hunks: &[(DisplayDiffHunk, Option<Hitbox>)],
         row_infos: &[RowInfo],
         start_row: DisplayRow,
+        visible_ranges: &[Range<Anchor>],
         snapshot: &EditorSnapshot,
         highlighted_ranges: &mut Vec<(Range<DisplayPoint>, Hsla)>,
         cx: &mut App,
     ) {
         let colors = cx.theme().colors();
 
-        let visible_start =
-            DisplayPoint::new(start_row, 0).to_offset(&snapshot.display_snapshot, Bias::Left);
-        let visible_end = DisplayPoint::new(DisplayRow(start_row.0 + row_infos.len() as u32), 0)
-            .to_offset(&snapshot.display_snapshot, Bias::Right);
+        let buffer = snapshot.buffer_snapshot();
+        let visible_ranges = visible_ranges
+            .iter()
+            .map(|range| range.start.to_offset(buffer)..range.end.to_offset(buffer))
+            .collect::<Vec<_>>();
 
         // Gather the word diffs that intersect the viewport. A hunk stores the
         // word diffs for its entire range, so without this filter a large hunk
@@ -4861,7 +4863,11 @@ impl EditorElement {
                 _ => None,
             })
             .flatten()
-            .filter(|word_diff| word_diff.start < visible_end && word_diff.end > visible_start)
+            .filter(|word_diff| {
+                visible_ranges
+                    .iter()
+                    .any(|visible| word_diff.start < visible.end && word_diff.end > visible.start)
+            })
             .collect();
 
         // The converter walks each display-map layer with a forward-only cursor,
@@ -5802,6 +5808,7 @@ impl EditorElement {
         &self,
         snapshot: &EditorSnapshot,
         visible_rows: Range<DisplayRow>,
+        visible_ranges: &[Range<Anchor>],
         line_layouts: &mut [LineWithInvisibles],
     ) {
         if visible_rows.is_empty() {
@@ -5811,15 +5818,12 @@ impl EditorElement {
         let display_snapshot = &snapshot.display_snapshot;
         let buffer_snapshot = snapshot.buffer_snapshot();
 
-        let query_start = display_snapshot
-            .display_point_to_point(DisplayPoint::new(visible_rows.start, 0), Bias::Left);
-        let query_end_display = display_snapshot
-            .clip_ignoring_line_ends(DisplayPoint::new(visible_rows.end, 0), Bias::Right);
-        let query_end = display_snapshot.display_point_to_point(query_end_display, Bias::Right);
-
-        for (point, diagnostic) in
-            Self::point_diagnostics_in_range(buffer_snapshot, query_start..query_end)
-        {
+        for (point, diagnostic) in visible_ranges.iter().flat_map(|range| {
+            Self::point_diagnostics_in_range(
+                buffer_snapshot,
+                range.start.to_point(buffer_snapshot)..range.end.to_point(buffer_snapshot),
+            )
+        }) {
             if display_snapshot.intersects_fold(point) {
                 continue;
             }
@@ -8987,6 +8991,23 @@ impl Element for EditorElement {
                         )
                     };
 
+                    let horizontal_viewport = |scroll_x: ScrollOffset| HorizontalViewport {
+                        scroll_columns: scroll_x,
+                        visible_columns,
+                    };
+                    let row_windowing = row_windowing(
+                        &snapshot,
+                        start_row..end_row,
+                        horizontal_viewport(scroll_position.x),
+                        grid_cell,
+                    );
+                    let highlight_ranges = visible_highlight_ranges(
+                        &snapshot,
+                        start_row..end_row,
+                        start_anchor..end_anchor,
+                        row_windowing,
+                    );
+
                     let mut highlighted_rows =
                         self.editor.read(cx).highlighted_display_rows_in_range(
                             start_anchor..end_anchor,
@@ -8999,11 +9020,17 @@ impl Element for EditorElement {
                         .editor_with_selections(cx)
                         .map(|editor| {
                             if editor == self.editor {
-                                editor.read(cx).background_highlights_in_range(
-                                    start_anchor..end_anchor,
-                                    &snapshot.display_snapshot,
-                                    cx.theme(),
-                                )
+                                let editor = editor.read(cx);
+                                highlight_ranges
+                                    .iter()
+                                    .flat_map(|range| {
+                                        editor.background_highlights_in_range(
+                                            range.clone(),
+                                            &snapshot.display_snapshot,
+                                            cx.theme(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
                             } else {
                                 editor.update(cx, |editor, cx| {
                                     let snapshot = editor.snapshot(window, cx);
@@ -9335,6 +9362,7 @@ impl Element for EditorElement {
                         &display_hunks,
                         &row_infos,
                         start_row,
+                        &highlight_ranges,
                         &snapshot,
                         &mut highlighted_ranges,
                         cx,
@@ -9349,17 +9377,6 @@ impl Element for EditorElement {
                                 .flat_map(|(_, colors)| colors.iter().cloned()),
                         ),
                         self.style.background,
-                    );
-
-                    let horizontal_viewport = |scroll_x: ScrollOffset| HorizontalViewport {
-                        scroll_columns: scroll_x,
-                        visible_columns,
-                    };
-                    let row_windowing = row_windowing(
-                        &snapshot,
-                        start_row..end_row,
-                        horizontal_viewport(scroll_position.x),
-                        grid_cell,
                     );
 
                     let mut line_layouts = Self::layout_lines(
@@ -10232,6 +10249,7 @@ impl Element for EditorElement {
                     self.populate_point_diagnostics(
                         &snapshot,
                         start_row..end_row,
+                        &highlight_ranges,
                         &mut line_layouts,
                     );
 
@@ -11144,6 +11162,46 @@ fn row_windowing(
     (!snapshot.has_soft_wraps()
         && (rows.start.0..rows.end.0).any(|row| snapshot.is_windowed_row(DisplayRow(row))))
     .then_some((viewport, cell))
+}
+
+fn visible_highlight_ranges(
+    snapshot: &EditorSnapshot,
+    rows: Range<DisplayRow>,
+    visible_range: Range<Anchor>,
+    row_windowing: Option<(HorizontalViewport, GridCell)>,
+) -> Vec<Range<Anchor>> {
+    let Some((viewport, cell)) = row_windowing else {
+        return vec![visible_range];
+    };
+    let buffer = snapshot.buffer_snapshot();
+    let anchor_at =
+        |point: DisplayPoint, bias: Bias| buffer.anchor_at(point.to_offset(snapshot, bias), bias);
+    let grid_snapshot = Arc::new(snapshot.display_snapshot.clone());
+    let mut ranges = Vec::new();
+    let mut run_start = Some(visible_range.start);
+    for row in rows.start.0..rows.end.0 {
+        let display_row = DisplayRow(row);
+        if snapshot.is_windowed_row(display_row) {
+            if let Some(run_start) = run_start.take() {
+                ranges.push(run_start..anchor_at(DisplayPoint::new(display_row, 0), Bias::Right));
+            }
+            let grid = UnwrappedRowGrid::new(grid_snapshot.clone(), display_row);
+            let bounds = viewport.shaping_bounds(&grid, cell);
+            ranges.push(
+                anchor_at(DisplayPoint::new(display_row, bounds.start), Bias::Left)
+                    ..anchor_at(DisplayPoint::new(display_row, bounds.end), Bias::Right),
+            );
+            run_start = Some(anchor_at(
+                DisplayPoint::new(display_row, grid.byte_len()),
+                Bias::Left,
+            ));
+        }
+    }
+    if let Some(run_start) = run_start {
+        ranges.push(run_start..visible_range.end);
+    }
+    ranges.retain(|range| range.start.cmp(&range.end, buffer).is_lt());
+    ranges
 }
 
 fn layout_windowed_row(
@@ -13556,6 +13614,66 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    #[gpui::test]
+    fn test_visible_highlight_ranges_clip_windowed_rows(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let long_len = MAX_LINE_LEN * 20;
+        let text = format!(
+            "short\n{}\nmid\ndle\n{}\ntail",
+            "x".repeat(long_len),
+            "y".repeat(long_len)
+        );
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.set_visible_column_count(100.);
+                editor.set_scroll_position(gpui::point(5_000., 0.), window, cx);
+                let snapshot = editor.snapshot(window, cx);
+                let buffer = snapshot.buffer_snapshot();
+                let details = editor.text_layout_details(window, cx);
+                let viewport = details.horizontal_viewport(&snapshot);
+                let rows = DisplayRow(0)..DisplayRow(6);
+                let visible = Anchor::Min..Anchor::Max;
+
+                let ranges =
+                    visible_highlight_ranges(&snapshot, rows.clone(), visible.clone(), None);
+                assert_eq!(ranges.len(), 1);
+
+                let ranges = visible_highlight_ranges(
+                    &snapshot,
+                    rows,
+                    visible,
+                    Some((viewport, details.grid_cell())),
+                );
+                let offsets = ranges
+                    .iter()
+                    .map(|range| {
+                        let start = range.start.to_offset(buffer).0;
+                        let end = range.end.to_offset(buffer).0;
+                        start..end
+                    })
+                    .collect::<Vec<_>>();
+                let long_row_start = "short\n".len();
+                let second_long_row_start = long_row_start + long_len + "\nmid\ndle\n".len();
+                assert_eq!(offsets.len(), 5);
+                assert_eq!(offsets[0], 0..long_row_start);
+                assert!(offsets[1].start > long_row_start + 4_000);
+                assert!(offsets[1].end < long_row_start + long_len);
+                assert!(offsets[1].end - offsets[1].start <= 8 * 100 + 1);
+                assert_eq!(offsets[2], long_row_start + long_len..second_long_row_start);
+                assert!(offsets[3].start > second_long_row_start + 4_000);
+                assert!(offsets[3].end < second_long_row_start + long_len);
+                assert_eq!(offsets[4], second_long_row_start + long_len..text.len());
+            })
+            .unwrap();
     }
 
     #[gpui::test]

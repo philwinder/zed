@@ -1772,6 +1772,14 @@ impl HorizontalViewport {
         RowWindow::from_scalar_columns(grid, start..end)
     }
 
+    pub fn shaping_bounds(&self, grid: &UnwrappedRowGrid, cell: GridCell) -> Range<u32> {
+        let window = self.shaping_window(grid, cell);
+        let max_end =
+            window.scalar_columns.start as usize + self.column_count() * Self::MAX_WINDOW_VIEWPORTS;
+        let end = grid.byte_column(u32::try_from(max_end).unwrap_or(u32::MAX), Bias::Right);
+        window.bytes.start..end.byte_column.max(window.bytes.end)
+    }
+
     pub fn extended_shaping_window(
         &self,
         grid: &UnwrappedRowGrid,
@@ -2275,6 +2283,38 @@ impl DisplaySnapshot {
         self.mask_chunks_if_needed(chunks).map(|h| h.text)
     }
 
+    fn text_chunks_from(&self, point: DisplayPoint) -> impl Iterator<Item = &str> {
+        let language_aware = LanguageAwareStyling {
+            tree_sitter: false,
+            diagnostics: false,
+        };
+        if self.is_windowed_row(point.row()) {
+            let start = self.block_snapshot.to_wrap_point(point.0, Bias::Left);
+            let end = WrapPoint::new(start.row(), self.wrap_snapshot().line_len(start.row()));
+            let chunks =
+                self.wrap_snapshot()
+                    .chunks(start..end, language_aware, Highlights::default());
+            Either::Left(self.mask_chunks_if_needed(chunks).map(|chunk| chunk.text))
+        } else {
+            let chunks = self.block_snapshot.chunks(
+                BlockRow(point.row().0)..BlockRow(self.max_point().row().next_row().0),
+                language_aware,
+                Highlights::default(),
+            );
+            let mut column = 0;
+            Either::Right(
+                self.mask_chunks_if_needed(chunks)
+                    .map(|chunk| chunk.text)
+                    .filter_map(move |chunk| {
+                        let chunk_start = column;
+                        column += chunk.len() as u32;
+                        let skip = point.column().saturating_sub(chunk_start) as usize;
+                        (skip < chunk.len()).then(|| &chunk[skip..])
+                    }),
+            )
+        }
+    }
+
     /// Returns text chunks starting at the end of the given display row in reverse until the start of the file
     #[instrument(skip_all)]
     pub fn reverse_text_chunks(&self, display_row: DisplayRow) -> impl Iterator<Item = &str> {
@@ -2586,16 +2626,8 @@ impl DisplaySnapshot {
     pub fn grapheme_at(&self, mut point: DisplayPoint) -> Option<SharedString> {
         point = DisplayPoint(self.block_snapshot.clip_point(point.0, Bias::Left));
         let chars = self
-            .text_chunks(point.row())
+            .text_chunks_from(point)
             .flat_map(str::chars)
-            .skip_while({
-                let mut column = 0;
-                move |char| {
-                    let at_point = column >= point.column();
-                    column += char.len_utf8() as u32;
-                    !at_point
-                }
-            })
             .take_while({
                 let mut prev = false;
                 move |char| {
@@ -4258,6 +4290,53 @@ pub mod tests {
                 bytes: 150..900,
                 scalar_columns: 50..300,
             }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_grapheme_at_on_windowed_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        let long_len = MAX_LINE_LEN * 3;
+        let text = format!("{}e\u{301}漢\t!\nshort", "x".repeat(long_len));
+        let mut snapshot = build_snapshot(&text, cx);
+        assert!(snapshot.is_windowed_row(DisplayRow(0)));
+
+        let column = long_len as u32;
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(0), column)),
+            Some("e\u{301}".into())
+        );
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(0), column + 3)),
+            Some("漢".into())
+        );
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(0), column - 1)),
+            Some("x".into())
+        );
+        assert_eq!(snapshot.line_len(DisplayRow(0)), column + 8);
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(0), column + 6)),
+            None
+        );
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(0), column + 7)),
+            Some("!".into())
+        );
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(0), column + 8)),
+            None
+        );
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(1), 1)),
+            Some("h".into())
+        );
+
+        snapshot.masked = true;
+        assert_eq!(
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(0), column)),
+            Some("*".into())
         );
     }
 
